@@ -1,0 +1,96 @@
+// ==UserScript==
+// @name         Reddit Movie Collector UI
+// @namespace    http://tampermonkey.net/
+// @version      1.1
+// @description  Click comments to collect movie names with a clean floating UI display.
+// @author       You
+// @match        https://old.reddit.com/r/MovieSuggestions/*
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const movieList = [];
+
+    // Create floating UI container
+    const uiBox = document.createElement('div');
+    uiBox.id = 'movieCollectorUI';
+    uiBox.innerHTML = `
+        <div id="movieHeader">🎬 Movie Collector <button id="copyBtn">Copy</button></div>
+        <div id="movieContent">(click a comment to add)</div>
+    `;
+    document.body.appendChild(uiBox);
+
+    // Styles
+    GM_addStyle(`
+        #movieCollectorUI {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 300px;
+            max-height: 300px;
+            overflow-y: auto;
+            background: #fff;
+            border: 1px solid #ccc;
+            border-radius: 10px;
+            font-family: sans-serif;
+            font-size: 14px;
+            padding: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            z-index: 9999;
+        }
+        #movieHeader {
+            font-weight: bold;
+            margin-bottom: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        #movieHeader button {
+            background: #0079d3;
+            border: none;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        #movieHeader button:hover {
+            background: #005fa3;
+        }
+        #movieContent {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+    `);
+
+    // Update the floating box
+    function updateUI() {
+        const movieContent = document.getElementById('movieContent');
+        movieContent.textContent = movieList.map(m => `"${m}"`).join(', ');
+    }
+
+    // Copy button functionality
+    document.getElementById('copyBtn').addEventListener('click', () => {
+        const text = movieList.map(m => `"${m}"`).join(', ');
+        navigator.clipboard.writeText(text).then(() => {
+            alert('Copied to clipboard!');
+        });
+    });
+
+    // Main click handler
+    document.addEventListener('click', function (e) {
+        const commentContainer = e.target.closest('.thing');
+
+        if (commentContainer) {
+            const mdText = commentContainer.querySelector('.usertext-body .md p');
+            if (mdText) {
+                const movie = mdText.textContent.trim();
+                if (movie && !movieList.includes(movie)) {
+                    movieList.push(movie);
+                    updateUI();
+                }
+            }
+        }
+    });
+})();
