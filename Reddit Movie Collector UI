@@ -8,6 +8,7 @@
 
 // @match        https://old.reddit.com/r/MovieSuggestions/*
 // @match        https://old.reddit.com/r/movies/*
+// @match        https://old.reddit.com/r/horror/*
 
 //
 // @grant        GM_addStyle
