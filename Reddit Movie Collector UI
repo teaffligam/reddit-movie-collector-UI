@@ -1,44 +1,433 @@
 // ==UserScript==
-// @name         Reddit Movie Collector UI
-// @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  Click comments to collect movie names with a clean floating UI display.
-// @author       You
-// @icon         https://www.reddit.com/favicon.ico
-
-// @match        https://old.reddit.com/r/MovieSuggestions/*
-// @match        https://old.reddit.com/r/movies/*
-// @match        https://old.reddit.com/r/horror/*
-
-//
-// @grant        GM_addStyle
+// @name Reddit Movie Utilities: Hider & Collector (Infinite Scroll Fixed)
+// @namespace http://tampermonkey.net/
+// @version 2.16
+// @description Hide blocked comments, count movie titles, and manually collect movies by clicking comments, with persistence across reloads and infinite scroll support.
+// @author You
+// @icon https://www.reddit.com/favicon.ico
+// @match https://old.reddit.com/r/MovieSuggestions/comments/*
+// @match https://old.reddit.com/r/movies/comments/*
+// @match https://old.reddit.com/r/horror/comments/*
+// @match https://old.reddit.com/r/horrorreviewed/comments/*
+// @grant GM_addStyle
+// @grant GM_getValue
+// @grant GM_setValue
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const movieList = [];
+    // --- CONFIGURATION ---
+    const blocklist = [
+	
+	
+        "interstellar", "moon", "sixth sense", "the princess bride", "coherence",
+   
+    ];
 
-    // Create floating UI container
-    const uiBox = document.createElement('div');
-    uiBox.id = 'movieCollectorUI';
-    uiBox.innerHTML = `
-        <div id="movieHeader">🎬 Movie Collector
-            <button id="copyBtn">Copy</button>
-            <button id="clearBtn">Clear</button>
+    const junkSuffixes = [
+        ' with ',
+        ' starring ',
+        ' featuring ',
+        ' directed by ',
+        ' from director ',
+        ' as ',
+        ' presented by '
+    ];
+
+    // --- STATE ---
+    let movieList = GM_getValue("movieList", []); // persistent list
+    let lastClickTime = 0;
+    let debugMode = GM_getValue("debugMode", false);
+    let processedComments = new Set(); // Track which comments we've already processed
+
+    function saveMovieList() {
+        GM_setValue("movieList", movieList);
+    }
+
+    function debugLog(message, data = null) {
+        if (debugMode) {
+            console.log(`[Movie Collector Debug] ${message}`, data || '');
+        }
+    }
+
+    function toggleDebug() {
+        debugMode = !debugMode;
+        GM_setValue("debugMode", debugMode);
+        debugLog(`Debug mode ${debugMode ? 'enabled' : 'disabled'}`);
+        updateUI();
+    }
+
+    // --- COMMENT HIDING & STATS LOGIC ---
+    let hiddenCommentCount = 0;
+    let totalTitleCount = 0;
+    let blockedTitleCount = 0;
+    const MIN_MENTIONS = 2;
+
+    function hideElements() {
+        const comments = document.querySelectorAll('.thing.comment');
+        const visibleComments = [];
+
+        comments.forEach(comment => {
+            const commentId = comment.getAttribute('data-fullname') || comment.id;
+
+            // Skip if already processed
+            if (processedComments.has(commentId)) {
+                if (comment.style.display !== 'none') {
+                    visibleComments.push(comment);
+                }
+                return;
+            }
+
+            const md = comment.querySelector('.usertext-body .md');
+            const commentText = md ? md.textContent.toLowerCase() : '';
+            const isBlocked = blocklist.some(keyword => commentText.includes(keyword.toLowerCase()));
+
+            if (isBlocked) {
+                hiddenCommentCount++;
+                comment.style.display = 'none';
+                debugLog(`Hiding comment: ${commentId}`);
+            } else {
+                visibleComments.push(comment);
+            }
+
+            processedComments.add(commentId);
+        });
+
+        debugLog(`Processed ${comments.length} comments, ${hiddenCommentCount} hidden, ${visibleComments.length} visible`);
+        return visibleComments;
+    }
+
+    function normalizeTitle(title) {
+        let normalized = title.toLowerCase();
+        normalized = normalized.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()'"']/g, '');
+        normalized = normalized.replace(/\s+/g, ' ');
+        normalized = normalized.trim();
+        return normalized;
+    }
+
+    function isBlockedTitle(normTitle) {
+        const blocked = blocklist.some(keyword => normTitle.includes(normalizeTitle(keyword)));
+        debugLog(`Checking if "${normTitle}" is blocked:`, blocked);
+        return blocked;
+    }
+
+    function isLikelyMovieTitle(commentText) {
+        const MAX_TITLE_LENGTH = 40;
+        const MAX_WORDS = 6;
+        const trimmed = commentText.trim();
+        const wordCount = trimmed.split(/\s+/).length;
+        return trimmed.length <= MAX_TITLE_LENGTH && wordCount <= MAX_WORDS;
+    }
+
+    function extractTitles(text) {
+        const titles = [];
+        const regex = /\b([A-Z][a-z0-9''\-]*(?:\s+[A-Z][a-z0-9''\-]*){1,5})\b/g;
+        let match;
+        while ((match = regex.exec(text)) !== null) {
+            const candidate = match[1].trim();
+            const wordCount = candidate.split(/\s+/).length;
+            if (wordCount >= 2 && wordCount <= 6 && candidate.length <= 40) titles.push(candidate);
+        }
+        return titles;
+    }
+
+    function countTitles(comments) {
+        const titleCounts = {};
+        const originalTitles = {};
+        totalTitleCount = 0;
+        blockedTitleCount = 0;
+
+        comments.forEach(commentElement => {
+            const commentText = commentElement.innerText || commentElement.textContent;
+            const trimmed = commentText.trim();
+            if (isLikelyMovieTitle(trimmed)) {
+                const norm = normalizeTitle(trimmed);
+                totalTitleCount++;
+                if (!isBlockedTitle(norm)) {
+                    titleCounts[norm] = (titleCounts[norm] || 0) + 1;
+                    if (!originalTitles[norm]) originalTitles[norm] = trimmed;
+                } else blockedTitleCount++;
+            } else {
+                extractTitles(trimmed).forEach(title => {
+                    const norm = normalizeTitle(title);
+                    totalTitleCount++;
+                    if (!isBlockedTitle(norm)) {
+                        titleCounts[norm] = (titleCounts[norm] || 0) + 1;
+                        if (!originalTitles[norm]) originalTitles[norm] = title;
+                    } else blockedTitleCount++;
+                });
+            }
+        });
+
+        return { titleCounts, originalTitles };
+    }
+
+    function getSortedTitles(titleCounts, originalTitles) {
+        return Object.entries(titleCounts)
+            .filter(([norm, count]) => count >= MIN_MENTIONS)
+            .sort((a, b) => b[1] - a[1])
+            .map(([norm, count]) => [originalTitles[norm], count]);
+    }
+
+    function displayResults(sortedTitles) {
+        const oldContainer = document.getElementById('title-count-results');
+        if (oldContainer) oldContainer.remove();
+
+        const container = document.createElement('div');
+        container.id = 'title-count-results';
+        container.style.background = '#fffbe7';
+        container.style.border = '2px solid #e3c800';
+        container.style.padding = '1em';
+        container.style.margin = '1em 0';
+        container.style.fontSize = '1.2em';
+
+        let stats = `<div style="margin-bottom:0.5em;">
+            <b>Comments hidden:</b> ${hiddenCommentCount}<br>
+            <b>Movie titles found (total):</b> ${totalTitleCount}<br>
+            <b>Movie titles blocked (by keywords):</b> ${blockedTitleCount}
+        </div>`;
+
+        if (sortedTitles.length === 0) {
+            container.innerHTML = stats + `No movie titles (not blocked) found with at least ${MIN_MENTIONS} mentions.`;
+        } else {
+            container.innerHTML = stats +
+                `<b>Most Mentioned Movie Titles (min ${MIN_MENTIONS}, excluding blocked, normalized):</b><br><ol>` +
+                sortedTitles.map(([title, count]) => `<li><b>${title}</b> (${count} mentions)</li>`).join('') +
+                '</ol>';
+        }
+
+        const siteTable = document.getElementById('siteTable');
+        if (siteTable) siteTable.parentNode.insertBefore(container, siteTable);
+        else document.body.insertBefore(container, document.body.firstChild);
+    }
+
+    function recountAll() {
+        // Reset counts
+        hiddenCommentCount = 0;
+        processedComments.clear();
+
+        const visibleComments = hideElements();
+        const { titleCounts, originalTitles } = countTitles(visibleComments);
+        const sortedTitles = getSortedTitles(titleCounts, originalTitles);
+        displayResults(sortedTitles);
+    }
+
+    // --- CLEAN TITLE FOR MANUAL COLLECTION ---
+    const suffixPattern = new RegExp(`(?:${junkSuffixes.join('|')}).*$`, 'i');
+
+    function cleanMovieTitle(rawTitle) {
+        debugLog(`Cleaning title: "${rawTitle}"`);
+        let title = rawTitle.trim();
+        title = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
+        title = title.replace(/^(?:[A-Z][a-z]+'s?|\w+'s)\s+/g, '');
+        title = title.replace(suffixPattern, '');
+        title = title.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, '');
+        title = title.replace(/\s{2,}/g, ' ').trim();
+        debugLog(`Cleaned title: "${title}"`);
+        return title;
+    }
+
+    // --- UI & INITIALIZATION ---
+    function updateUI() {
+        const movieContent = document.getElementById('movieContent');
+        const debugStatus = document.getElementById('debugStatus');
+
+        if (movieContent) {
+            if (movieList.length > 0) {
+                movieContent.textContent = movieList.map(m => `"${m}"`).join(', ');
+            } else {
+                movieContent.textContent = 'Click a comment to add to your list.';
+            }
+        }
+
+        if (debugStatus) {
+            debugStatus.textContent = debugMode ? '🐛 ON' : '🐛 OFF';
+            debugStatus.style.color = debugMode ? 'green' : 'gray';
+        }
+    }
+
+    const movieUtilitiesUI = document.createElement('div');
+    movieUtilitiesUI.id = 'movieUtilitiesUI';
+    movieUtilitiesUI.innerHTML = `
+        <div id="uiHeader">🎬 Movie Utilities</div>
+        <div id="galleryButtons">
+            <button id="recountBtn">Recount</button>
+            <button id="debugBtn" style="font-size:10px;"><span id="debugStatus">🐛</span></button>
         </div>
-        <div id="movieContent">(click a comment to add)</div>
+        <div id="collectorSection">
+            <div id="collectorHeader">
+                <span>Manual Collector</span>
+                <div id="collectorControls">
+                    <button id="copyBtn">Copy</button>
+                    <button id="clearBtn">Clear</button>
+                </div>
+            </div>
+            <div id="movieContent">(click a comment to add)</div>
+        </div>
     `;
-    document.body.appendChild(uiBox);
+    document.body.appendChild(movieUtilitiesUI);
 
-    // Styles
+    document.getElementById('recountBtn').addEventListener('click', recountAll);
+    document.getElementById('debugBtn').addEventListener('click', toggleDebug);
+
+    document.getElementById('copyBtn').addEventListener('click', () => {
+        const textToCopy = movieList.map(m => `"${m}"`).join(', ');
+        navigator.clipboard.writeText(textToCopy).then(() => alert('Manual list copied!'));
+    });
+
+    document.getElementById('clearBtn').addEventListener('click', () => {
+        movieList = [];
+        saveMovieList();
+        updateUI();
+    });
+
+    // --- IMPROVED CLICK HANDLING ---
+    document.addEventListener('click', function (e) {
+        const currentTime = Date.now();
+
+        // Prevent double-clicks and rapid clicking
+        if (currentTime - lastClickTime < 200) {
+            debugLog('Click ignored: too rapid');
+            return;
+        }
+        lastClickTime = currentTime;
+
+        // Check if click is on UI elements
+        if (e.target.closest('#movieUtilitiesUI') || e.target.closest('#title-count-results')) {
+            debugLog('Click ignored: on UI element');
+            return;
+        }
+
+        // Check if text is currently selected
+        const selection = window.getSelection();
+        if (selection.toString().trim().length > 0) {
+            debugLog('Click ignored: text is selected');
+            return;
+        }
+
+        const commentContainer = e.target.closest('.thing');
+        debugLog('Comment container found:', !!commentContainer);
+
+        if (commentContainer) {
+            // Try multiple selectors for comment text
+            const selectors = [
+                '.usertext-body .md p',
+                '.usertext-body .md',
+                '.usertext-body',
+                '.entry .usertext .usertext-body .md p',
+                '.entry .usertext .usertext-body .md'
+            ];
+
+            let mdText = null;
+            for (const selector of selectors) {
+                mdText = commentContainer.querySelector(selector);
+                if (mdText) {
+                    debugLog(`Found text with selector: ${selector}`);
+                    break;
+                }
+            }
+
+            if (mdText) {
+                const rawTitle = mdText.textContent.trim();
+                debugLog('Raw title extracted:', rawTitle);
+
+                if (rawTitle.length === 0) {
+                    debugLog('Title is empty');
+                    return;
+                }
+
+                const movie = cleanMovieTitle(rawTitle);
+                debugLog('Cleaned movie title:', movie);
+
+                if (movie && movie.length > 0) {
+                    const normalizedForBlocking = normalizeTitle(movie);
+                    debugLog('Normalized for blocking check:', normalizedForBlocking);
+
+                    if (!isBlockedTitle(normalizedForBlocking)) {
+                        if (!movieList.includes(movie)) {
+                            movieList.push(movie);
+                            saveMovieList();
+                            updateUI();
+                            debugLog('Movie added to list:', movie);
+
+                            // Visual feedback
+                            commentContainer.style.backgroundColor = '#e8f5e8';
+                            setTimeout(() => {
+                                commentContainer.style.backgroundColor = '';
+                            }, 1000);
+                        } else {
+                            debugLog('Movie already in list:', movie);
+                        }
+                    } else {
+                        debugLog('Movie is blocked:', movie);
+                    }
+                } else {
+                    debugLog('Movie title is empty after cleaning');
+                }
+            } else {
+                debugLog('No comment text found with any selector');
+                // Debug: show what selectors are available
+                if (debugMode) {
+                    const allElements = commentContainer.querySelectorAll('*');
+                    console.log('Available elements in comment:', Array.from(allElements).map(el => el.tagName + (el.className ? '.' + el.className.replace(/\s+/g, '.') : '')));
+                }
+            }
+        }
+    });
+
+    // --- MUTATION OBSERVER FOR DYNAMIC CONTENT ---
+    function setupMutationObserver() {
+        const observer = new MutationObserver((mutations) => {
+            let newCommentsDetected = false;
+
+            mutations.forEach((mutation) => {
+                mutation.addedNodes.forEach((node) => {
+                    // Check if the added node is a comment or contains comments
+                    if (node.nodeType === 1) { // Element node
+                        if (node.classList && node.classList.contains('comment')) {
+                            newCommentsDetected = true;
+                        } else if (node.querySelectorAll) {
+                            const comments = node.querySelectorAll('.thing.comment');
+                            if (comments.length > 0) {
+                                newCommentsDetected = true;
+                            }
+                        }
+                    }
+                });
+            });
+
+            if (newCommentsDetected) {
+                debugLog('New comments detected via mutation observer');
+                // Process new comments
+                hideElements();
+                // Update the count display
+                const visibleComments = document.querySelectorAll('.thing.comment:not([style*="display: none"])');
+                const { titleCounts, originalTitles } = countTitles(visibleComments);
+                const sortedTitles = getSortedTitles(titleCounts, originalTitles);
+                displayResults(sortedTitles);
+            }
+        });
+
+        // Start observing the document body for changes
+        const targetNode = document.body;
+        const config = {
+            childList: true,
+            subtree: true
+        };
+
+        observer.observe(targetNode, config);
+        debugLog('Mutation observer initialized');
+    }
+
+    // --- STYLES ---
     GM_addStyle(`
-        #movieCollectorUI {
+        #movieUtilitiesUI {
             position: fixed;
             bottom: 20px;
             right: 20px;
             width: 300px;
-            max-height: 300px;
+            max-height: 400px;
             overflow-y: auto;
             background: #fff;
             border: 1px solid #ccc;
@@ -49,78 +438,24 @@
             box-shadow: 0 2px 10px rgba(0,0,0,0.2);
             z-index: 9999;
         }
-        #movieHeader {
-            font-weight: bold;
-            margin-bottom: 5px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        #movieHeader button {
-            background: #0079d3;
-            border: none;
-            color: white;
-            padding: 4px 8px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-        #movieHeader button:hover {
-            background: #005fa3;
-        }
-        #movieContent {
-            white-space: pre-wrap;
-            word-wrap: break-word;
-        }
+        #uiHeader { font-size:16px; font-weight:bold; margin-bottom:10px; border-bottom:1px solid #eee; padding-bottom:5px; }
+        #galleryButtons { display:flex; justify-content:space-between; margin-bottom:10px; }
+        #collectorSection { border-top:1px solid #eee; padding-top:10px; }
+        #collectorHeader { display:flex; justify-content:space-between; align-items:center; font-weight:bold; margin-bottom:5px; }
+        #collectorControls { display:flex; gap:5px; }
+        #movieUtilitiesUI button { background:#0079d3; border:none; color:white; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:12px; }
+        #movieUtilitiesUI button:hover { background:#005fa3; }
+        #movieContent { white-space: pre-wrap; word-wrap: break-word; }
+        #title-count-results { background:#fffbe7; border:2px solid #e3c800; padding:1em; margin:1em 0; font-size:1.2em; }
     `);
 
-    // Update the floating box
-    function updateUI() {
-        const movieContent = document.getElementById('movieContent');
-        movieContent.textContent = movieList.map(m => `"${m}"`).join(', ');
-    }
-
-    // Copy button functionality
-    document.getElementById('copyBtn').addEventListener('click', () => {
-        const text = movieList.map(m => `"${m}"`).join(', ');
-        navigator.clipboard.writeText(text).then(() => {
-            alert('Copied to clipboard!');
-        });
-    });
-
-    // Clear button functionality
-    document.getElementById('clearBtn').addEventListener('click', () => {
-        movieList.length = 0; // Clear the movie list
-        updateUI(); // Update UI to show empty list
-    });
-
-    // Prevent adding movies when the text is highlighted, only when clicked
-    let isHighlighting = false;
-
-    // Monitor selection changes
-    document.addEventListener('selectionchange', () => {
-        const selection = window.getSelection();
-        isHighlighting = selection.toString().trim().length > 0;
-    });
-
-    // Main click handler
-    document.addEventListener('click', function (e) {
-        // Only proceed if the user isn't just highlighting text
-        if (isHighlighting) {
-            isHighlighting = false; // Reset after click
-            return;
-        }
-
-        const commentContainer = e.target.closest('.thing');
-        if (commentContainer) {
-            const mdText = commentContainer.querySelector('.usertext-body .md p');
-            if (mdText) {
-                const movie = mdText.textContent.trim();
-                if (movie && !movieList.includes(movie)) {
-                    movieList.push(movie);
-                    updateUI();
-                }
-            }
-        }
+    // --- INITIAL LOAD ---
+    window.addEventListener('load', () => {
+        setTimeout(() => {
+            recountAll();
+            updateUI();
+            setupMutationObserver(); // Start watching for dynamic content
+            debugLog('Script initialized with mutation observer');
+        }, 1000);
     });
 })();
