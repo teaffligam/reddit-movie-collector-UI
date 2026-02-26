@@ -41,11 +41,45 @@ When enabled, inline poster cards appear beneath comments that mention films —
 
 ## Installation
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser
-2. Click **[this link to the raw script](../../raw/main/reddit-movie-utils-tampermonkey.user.js)** — Tampermonkey will detect the `.user.js` and prompt you to install automatically
-3. Click **Install** and you're done
+Userscripts need a browser extension to run them. The two most popular options are **Tampermonkey** and **Violentmonkey** — both are free, both work with this script. Pick one.
 
-Or install manually: open Tampermonkey → **Dashboard** → **+** → paste the script contents → **Save**.
+---
+
+### Step 1 — Install a userscript manager
+
+**Google Chrome**
+- [Tampermonkey for Chrome](https://chrome.google.com/webstore/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo) → click **Add to Chrome** → **Add extension**
+- [Violentmonkey for Chrome](https://chrome.google.com/webstore/detail/violentmonkey/jinjaccalgkegedbjlghdfcdaenckbbf) → click **Add to Chrome** → **Add extension**
+
+**Mozilla Firefox**
+- [Tampermonkey for Firefox](https://addons.mozilla.org/en-US/firefox/addon/tampermonkey/) → click **Add to Firefox** → **Add**
+- [Violentmonkey for Firefox](https://addons.mozilla.org/en-US/firefox/addon/violentmonkey/) → click **Add to Firefox** → **Add**
+
+Once installed you'll see a small icon in your browser toolbar (a square with a checkmark for Tampermonkey, or a purple icon for Violentmonkey).
+
+---
+
+### Step 2 — Install the script
+
+**Option A — One-click install (easiest)**
+
+Click **[here to install the script](../../raw/main/reddit-movie-utils-tampermonkey.user.js)**. Your userscript manager will detect the file and show an install screen. Click **Install** and you're done.
+
+**Option B — Copy & paste (if Option A doesn't work)**
+
+1. Open the file [`reddit-movie-utils-tampermonkey.user.js`](../../blob/main/reddit-movie-utils-tampermonkey.user.js) in this repo
+2. Click the **Raw** button (top-right of the file view) and select all the text (`Ctrl+A` / `Cmd+A`), then copy it (`Ctrl+C` / `Cmd+C`)
+3. Click the userscript manager icon in your toolbar
+4. **Tampermonkey:** click **Create a new script** — delete any placeholder text, paste yours in, then hit `Ctrl+S` / `Cmd+S` to save
+5. **Violentmonkey:** click the **+** button → **New script** — delete the placeholder, paste, then click **Save**
+
+---
+
+### Step 3 — Verify it's working
+
+Go to any supported Reddit thread (e.g. [r/horror](https://www.reddit.com/r/horror/) and open any post with comments). You should see the **🎬 Movie Utilities** panel appear in the bottom-right corner of the page within a couple of seconds.
+
+If the panel doesn't appear, try refreshing the page. If it still doesn't show, check that the script is enabled in your userscript manager dashboard.
 
 ---
 
