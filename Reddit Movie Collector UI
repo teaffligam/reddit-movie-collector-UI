@@ -1,461 +1,1086 @@
 // ==UserScript==
-// @name Reddit Movie Utilities: Hider & Collector (Infinite Scroll Fixed)
-// @namespace http://tampermonkey.net/
-// @version 2.16
-// @description Hide blocked comments, count movie titles, and manually collect movies by clicking comments, with persistence across reloads and infinite scroll support.
-// @author You
-// @icon https://www.reddit.com/favicon.ico
-// @match https://old.reddit.com/r/MovieSuggestions/comments/*
-// @match https://old.reddit.com/r/movies/comments/*
-// @match https://old.reddit.com/r/horror/comments/*
-// @match https://old.reddit.com/r/horrorreviewed/comments/*
-// @grant GM_addStyle
-// @grant GM_getValue
-// @grant GM_setValue
+// @name         Reddit Movie Utilities
+// @namespace    http://tampermonkey.net/
+// @version      1.0.0
+// @description  Hide spoilers, count movie mentions, collect titles & browse TMDB posters — all inside Reddit movie threads.
+// @author       You
+// @icon         https://www.reddit.com/favicon.ico
+// @match        https://www.reddit.com/r/horror/comments/*
+// @match        https://www.reddit.com/r/movies/comments/*
+// @match        https://www.reddit.com/r/MovieSuggestions/comments/*
+// @match        https://www.reddit.com/r/horrorreviewed/comments/*
+// @match        https://www.reddit.com/r/MovieRecommendations/comments/*
+// @match        https://old.reddit.com/r/horror/comments/*
+// @match        https://old.reddit.com/r/movies/comments/*
+// @match        https://old.reddit.com/r/MovieSuggestions/comments/*
+// @match        https://old.reddit.com/r/horrorreviewed/comments/*
+// @match        https://old.reddit.com/r/MovieRecommendations/comments/*
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @connect      api.themoviedb.org
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    // --- CONFIGURATION ---
-    const blocklist = [
-	
-	
-        "interstellar", "moon", "sixth sense", "the princess bride", "coherence",
-   
-    ];
+    // =========================================================
+    // SITE DETECTION
+    // =========================================================
 
-    const junkSuffixes = [
-        ' with ',
-        ' starring ',
-        ' featuring ',
-        ' directed by ',
-        ' from director ',
-        ' as ',
-        ' presented by '
-    ];
+    const IS_NEW_REDDIT = location.hostname === 'www.reddit.com';
 
-    // --- STATE ---
-    let movieList = GM_getValue("movieList", []); // persistent list
-    let lastClickTime = 0;
-    let debugMode = GM_getValue("debugMode", false);
-    let processedComments = new Set(); // Track which comments we've already processed
+    // =========================================================
+    // STATE  (persisted via GM_getValue / GM_setValue)
+    // =========================================================
 
-    function saveMovieList() {
-        GM_setValue("movieList", movieList);
-    }
+    let TMDB_API_KEY     = GM_getValue('tmdbApiKey',      '');
+    let blocklist        = GM_getValue('blocklist',        []);
+    let movieList        = GM_getValue('movieList',        []);
+    let galleryEnabled   = GM_getValue('galleryEnabled',   false);
+    let hiderEnabled     = GM_getValue('hiderEnabled',     true);
+    let counterEnabled   = GM_getValue('counterEnabled',   true);
+    let collectorEnabled = GM_getValue('collectorEnabled', true);
+    let debugMode        = GM_getValue('debugMode',        false);
 
-    function debugLog(message, data = null) {
-        if (debugMode) {
-            console.log(`[Movie Collector Debug] ${message}`, data || '');
-        }
-    }
+    // Tampermonkey may return JSON strings for arrays — normalise
+    if (typeof blocklist  === 'string') try { blocklist  = JSON.parse(blocklist);  } catch { blocklist  = []; }
+    if (typeof movieList  === 'string') try { movieList  = JSON.parse(movieList);  } catch { movieList  = []; }
 
-    function toggleDebug() {
-        debugMode = !debugMode;
-        GM_setValue("debugMode", debugMode);
-        debugLog(`Debug mode ${debugMode ? 'enabled' : 'disabled'}`);
-        updateUI();
-    }
-
-    // --- COMMENT HIDING & STATS LOGIC ---
-    let hiddenCommentCount = 0;
-    let totalTitleCount = 0;
-    let blockedTitleCount = 0;
+    const CACHE_EXPIRY = 7 * 24 * 60 * 60 * 1000;
     const MIN_MENTIONS = 2;
 
-    function hideElements() {
-        const comments = document.querySelectorAll('.thing.comment');
-        const visibleComments = [];
+    let hiddenCommentCount = 0;
+    let totalTitleCount    = 0;
+    let blockedTitleCount  = 0;
+    let lastClickTime      = 0;
 
-        comments.forEach(comment => {
-            const commentId = comment.getAttribute('data-fullname') || comment.id;
+    const processedHiderIds = new Set();
+    const processedGallery  = new WeakSet();
+    const tmdbMemCache      = new Map();
+    const tmdbPending       = new Map();
 
-            // Skip if already processed
-            if (processedComments.has(commentId)) {
-                if (comment.style.display !== 'none') {
-                    visibleComments.push(comment);
-                }
-                return;
+    const junkSuffixes = [
+        ' with ', ' starring ', ' featuring ', ' directed by ',
+        ' from director ', ' as ', ' presented by '
+    ];
+    const suffixPattern = new RegExp(`(?:${junkSuffixes.join('|')}).*$`, 'i');
+
+    // =========================================================
+    // PERSISTENCE
+    // =========================================================
+
+    function saveBlocklist()  { GM_setValue('blocklist',  JSON.stringify(blocklist)); }
+    function saveMovieList()  { GM_setValue('movieList',  JSON.stringify(movieList)); }
+    function saveSetting(k,v) { GM_setValue(k, v); }
+
+    // =========================================================
+    // SAFE DOM HELPER
+    // =========================================================
+
+    function el(tag, props = {}, ...children) {
+        const node = document.createElement(tag);
+        for (const [k, v] of Object.entries(props)) {
+            if (k === 'className')    node.className = v;
+            else if (k === 'textContent') node.textContent = v;
+            else if (k === 'style')   Object.assign(node.style, v);
+            else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
+            else node.setAttribute(k, v);
+        }
+        for (const child of children) {
+            if (child == null) continue;
+            node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+        }
+        return node;
+    }
+
+    // =========================================================
+    // TMDB CACHE  (localStorage, same as extension)
+    // =========================================================
+
+    function getCachedMovie(title) {
+        const raw = localStorage.getItem(`rmu_tmdb2_${title.toLowerCase()}`);
+        if (!raw) return null;
+        try {
+            const data = JSON.parse(raw);
+            if (Date.now() - data.ts > CACHE_EXPIRY) {
+                localStorage.removeItem(`rmu_tmdb2_${title.toLowerCase()}`);
+                return null;
             }
+            if (!data.movie?.id) return null;
+            return data.movie;
+        } catch { return null; }
+    }
 
-            const md = comment.querySelector('.usertext-body .md');
-            const commentText = md ? md.textContent.toLowerCase() : '';
-            const isBlocked = blocklist.some(keyword => commentText.includes(keyword.toLowerCase()));
+    function setCachedMovie(title, movie) {
+        try {
+            localStorage.setItem(`rmu_tmdb2_${title.toLowerCase()}`, JSON.stringify({ movie, ts: Date.now() }));
+        } catch (_) {}
+    }
 
-            if (isBlocked) {
-                hiddenCommentCount++;
-                comment.style.display = 'none';
-                debugLog(`Hiding comment: ${commentId}`);
-            } else {
-                visibleComments.push(comment);
-            }
+    // =========================================================
+    // UTILITIES
+    // =========================================================
 
-            processedComments.add(commentId);
-        });
-
-        debugLog(`Processed ${comments.length} comments, ${hiddenCommentCount} hidden, ${visibleComments.length} visible`);
-        return visibleComments;
+    function debugLog(msg, data = null) {
+        if (debugMode) console.log(`[RMU] ${msg}`, data || '');
     }
 
     function normalizeTitle(title) {
-        let normalized = title.toLowerCase();
-        normalized = normalized.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()'"']/g, '');
-        normalized = normalized.replace(/\s+/g, ' ');
-        normalized = normalized.trim();
-        return normalized;
+        return title.toLowerCase()
+            .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()'"']/g, '')
+            .replace(/\s+/g, ' ').trim();
     }
 
     function isBlockedTitle(normTitle) {
-        const blocked = blocklist.some(keyword => normTitle.includes(normalizeTitle(keyword)));
-        debugLog(`Checking if "${normTitle}" is blocked:`, blocked);
-        return blocked;
+        return blocklist.some(k => normTitle.includes(normalizeTitle(k)));
     }
 
-    function isLikelyMovieTitle(commentText) {
-        const MAX_TITLE_LENGTH = 40;
-        const MAX_WORDS = 6;
-        const trimmed = commentText.trim();
-        const wordCount = trimmed.split(/\s+/).length;
-        return trimmed.length <= MAX_TITLE_LENGTH && wordCount <= MAX_WORDS;
+    function cleanMovieTitle(raw) {
+        let t = raw.trim();
+        t = t.replace(/\s*\(\d{4}\)\s*$/, '').trim();
+        t = t.replace(/^(?:[A-Z][a-z]+'s?|\w+'s)\s+/g, '');
+        t = t.replace(suffixPattern, '');
+        t = t.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, '');
+        return t.replace(/\s{2,}/g, ' ').trim();
     }
 
-    function extractTitles(text) {
+    // Parse any comma-separated / quoted / JSON-array input into an array of titles
+    function parseBlocklistInput(raw) {
+        raw = raw.trim();
+        // Try JSON array first
+        try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed))
+                return parsed.map(s => String(s).trim().replace(/^[\u201c\u201d"']+|[\u201c\u201d"']+$/g, '').trim().toLowerCase()).filter(Boolean);
+        } catch (_) {}
+        // Freeform comma-separated
+        return raw
+            .split(',')
+            .map(s => s.trim().replace(/^[\u201c\u201d"']+|[\u201c\u201d"']+$/g, '').trim().toLowerCase())
+            .filter(Boolean);
+    }
+
+    // =========================================================
+    // REDDIT ABSTRACTION LAYER
+    // =========================================================
+
+    function getAllComments() {
+        return IS_NEW_REDDIT
+            ? Array.from(document.querySelectorAll('shreddit-comment'))
+            : Array.from(document.querySelectorAll('.thing.comment'));
+    }
+
+    function getCommentId(commentEl) {
+        return IS_NEW_REDDIT
+            ? (commentEl.getAttribute('thingid') || commentEl.id)
+            : (commentEl.getAttribute('data-fullname') || commentEl.id);
+    }
+
+    function getMdDiv(commentEl) {
+        if (IS_NEW_REDDIT) {
+            const thingid = commentEl.getAttribute('thingid');
+            if (thingid) {
+                const contentDiv = commentEl.querySelector(`[id="${thingid}-comment-rtjson-content"]`);
+                if (contentDiv) return contentDiv.querySelector('[class*="scalable-text"]') || contentDiv.querySelector('.md') || contentDiv;
+            }
+            return commentEl.querySelector('[class*="scalable-text"]') || commentEl.querySelector('.md');
+        }
+        return commentEl.querySelector('.usertext-body .md');
+    }
+
+    function getGalleryTargets() {
+        return IS_NEW_REDDIT
+            ? Array.from(document.querySelectorAll('shreddit-comment'))
+            : Array.from(document.querySelectorAll('.usertext-body'));
+    }
+
+    function getCommentFromClick(target) {
+        return IS_NEW_REDDIT
+            ? target.closest('shreddit-comment')
+            : target.closest('.thing');
+    }
+
+    function getCleanMdFullText(mdEl) {
+        const clone = mdEl.cloneNode(true);
+        clone.querySelectorAll('div.mgu-container').forEach(d => d.remove());
+        return clone.textContent;
+    }
+
+    function getCleanFirstParagraph(commentEl) {
+        const md = getMdDiv(commentEl);
+        if (!md) return '';
+        const clone = md.cloneNode(true);
+        clone.querySelectorAll('div.mgu-container').forEach(d => d.remove());
+        const firstP = clone.querySelector('p');
+        return (firstP ? firstP.textContent : clone.textContent).trim();
+    }
+
+    // =========================================================
+    // TMDB API  (uses GM_xmlhttpRequest to bypass CORS)
+    // =========================================================
+
+    function gmFetch(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                headers: { Accept: 'application/json' },
+                onload:  res => { try { resolve(JSON.parse(res.responseText)); } catch (e) { reject(e); } },
+                onerror: err => reject(err)
+            });
+        });
+    }
+
+    async function fetchMovieData(title) {
+        if (!TMDB_API_KEY) return null;
+        const norm = title.toLowerCase().trim();
+        if (tmdbMemCache.has(norm)) return tmdbMemCache.get(norm);
+        const cached = getCachedMovie(title);
+        if (cached) { tmdbMemCache.set(norm, cached); return cached; }
+        if (tmdbPending.has(norm)) return tmdbPending.get(norm);
+
+        const req = (async () => {
+            const clean = title.replace(/\s*\(\d{4}\).*/, '').trim();
+            try {
+                const data = await gmFetch(
+                    `https://api.themoviedb.org/3/search/movie?query=${encodeURIComponent(clean)}&language=en-US&include_adult=false&api_key=${TMDB_API_KEY}`
+                );
+                if (!data.results?.length) return null;
+                const m = data.results[0];
+                const movie = {
+                    id:       m.id,
+                    title:    m.title,
+                    year:     m.release_date ? new Date(m.release_date).getFullYear() : null,
+                    poster:   m.poster_path  ? `https://image.tmdb.org/t/p/w300${m.poster_path}` : null,
+                    rating:   m.vote_average ? m.vote_average.toFixed(1) : null,
+                    overview: m.overview || ''
+                };
+                setCachedMovie(title, movie);
+                tmdbMemCache.set(norm, movie);
+                return movie;
+            } catch (e) {
+                debugLog('TMDB error', e);
+                return null;
+            } finally {
+                tmdbPending.delete(norm);
+            }
+        })();
+
+        tmdbPending.set(norm, req);
+        return req;
+    }
+
+    async function fetchCredits(movieId) {
+        if (!TMDB_API_KEY) return null;
+        try {
+            return await gmFetch(`https://api.themoviedb.org/3/movie/${movieId}/credits?language=en-US&api_key=${TMDB_API_KEY}`);
+        } catch { return null; }
+    }
+
+    async function fetchDirectorFilms(directorId, currentMovieId) {
+        if (!TMDB_API_KEY) return null;
+        try {
+            const data = await gmFetch(`https://api.themoviedb.org/3/person/${directorId}/movie_credits?language=en-US&api_key=${TMDB_API_KEY}`);
+            const directed = (data.crew || []).filter(m => m.job === 'Director');
+            const others = directed
+                .filter(m => m.id !== currentMovieId)
+                .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
+                .slice(0, 3).map(m => m.title);
+            const latest = directed
+                .filter(m => m.release_date)
+                .sort((a, b) => new Date(b.release_date) - new Date(a.release_date))[0];
+            return { others, latest };
+        } catch { return null; }
+    }
+
+    // =========================================================
+    // GALLERY — extract titles from text
+    // =========================================================
+
+    function extractGalleryTitles(text) {
+        const titles = [];
+        for (let line of text.split(/[\n,•\-—]/)) {
+            line = line.trim();
+            if (line.length < 2 || line.length > 100) continue;
+            if (/^(https?:|www\.|reddit\.com|^\d+$)/i.test(line)) continue;
+            const m = line.match(/^([A-Z][a-zA-Z\s:'\-&!?.0-9]+)/);
+            if (m) {
+                const p = m[1].trim();
+                if (!/^(I |You |The |A |An |It |This |That |My |Your )/i.test(p) || p.split(' ').length >= 2) {
+                    titles.push(p);
+                }
+            }
+        }
+        return titles;
+    }
+
+    // =========================================================
+    // GALLERY — movie card
+    // =========================================================
+
+    function createMovieCard(movie) {
+        const posterWrap = el('div', { className: 'mgu-poster-wrap' });
+        const img = el('img', {
+            className: 'mgu-poster-img',
+            src: movie.poster || 'https://via.placeholder.com/200x300/333/666?text=No+Poster',
+            alt: movie.title
+        });
+        posterWrap.appendChild(img);
+
+        const info = el('div', { className: 'mgu-card-info' });
+        if (movie.rating) info.appendChild(el('div', { className: 'mgu-rating', textContent: `⭐ ${movie.rating}` }));
+        const titleEl = el('div', { className: 'mgu-card-title', textContent: movie.title });
+        titleEl.title = movie.title;
+        info.appendChild(titleEl);
+        info.appendChild(el('div', { className: 'mgu-card-year', textContent: movie.year || '—' }));
+
+        const card = el('div', { className: 'mgu-card' }, posterWrap, info);
+
+        card.addEventListener('click', async e => {
+            e.stopPropagation();
+            document.querySelector('.mgu-modal')?.remove();
+            const credits   = await fetchCredits(movie.id);
+            const director  = credits?.crew?.find(p => p.job === 'Director');
+            const topActors = (credits?.cast || []).slice(0, 3);
+            if (director) {
+                const films       = await fetchDirectorFilms(director.id, movie.id);
+                const otherMovies = films?.others?.join(', ') || null;
+                const latestInfo  = films?.latest ? `${films.latest.title} (${films.latest.release_date.slice(0,4)})` : null;
+                showMguPopup(movie, director.name, otherMovies, topActors, latestInfo);
+            } else {
+                showMguPopup(movie, null, null, topActors, null);
+            }
+        });
+
+        return card;
+    }
+
+    // =========================================================
+    // GALLERY — modal popup
+    // =========================================================
+
+    function showMguPopup(movie, directorName, otherMovies, topActors, latestMovieInfo) {
+        document.querySelector('.mgu-modal')?.remove();
+
+        const info = el('div', { className: 'mgu-modal-info' });
+        info.appendChild(el('div', { className: 'mgu-modal-title',    textContent: `${movie.title} (${movie.year || 'N/A'})` }));
+        info.appendChild(el('div', { className: 'mgu-modal-rating',   textContent: `⭐ ${movie.rating || '—'} / 10` }));
+        info.appendChild(el('div', { className: 'mgu-modal-overview', textContent: movie.overview || 'No description available.' }));
+
+        if (directorName) {
+            const d = el('div', { className: 'mgu-modal-director' });
+            d.appendChild(el('strong', { textContent: 'Director: ' }));
+            d.appendChild(document.createTextNode(directorName));
+            info.appendChild(d);
+        }
+        if (otherMovies) {
+            const o = el('div', { className: 'mgu-modal-others' });
+            o.appendChild(el('em', { textContent: 'Also directed: ' }));
+            o.appendChild(document.createTextNode(otherMovies));
+            info.appendChild(o);
+        }
+        if (latestMovieInfo) {
+            const l = el('div', { className: 'mgu-modal-latest' });
+            l.appendChild(el('strong', { textContent: "Director's latest: " }));
+            l.appendChild(document.createTextNode(latestMovieInfo));
+            info.appendChild(l);
+        }
+
+        const actorsRow = el('div', { className: 'mgu-modal-actors' });
+        topActors.forEach(actor => {
+            const actorEl = el('div', { className: 'mgu-actor' });
+            if (actor.profile_path) {
+                actorEl.appendChild(el('img', { src: `https://image.tmdb.org/t/p/w185${actor.profile_path}`, alt: actor.name }));
+            } else {
+                actorEl.appendChild(el('div', { className: 'mgu-actor-noimg' }));
+            }
+            actorEl.appendChild(el('div', { textContent: actor.name }));
+            actorsRow.appendChild(actorEl);
+        });
+        info.appendChild(actorsRow);
+        info.appendChild(el('a', {
+            className: 'mgu-letterboxd-btn',
+            href: `https://letterboxd.com/search/${encodeURIComponent(movie.title)}/`,
+            target: '_blank',
+            textContent: 'Search on Letterboxd'
+        }));
+
+        const inner = el('div', { className: 'mgu-modal-inner' });
+        if (movie.poster) inner.appendChild(el('img', { className: 'mgu-modal-poster', src: movie.poster, alt: movie.title }));
+        inner.appendChild(info);
+
+        const closeBtn = el('span', { className: 'mgu-modal-close', textContent: '✖' });
+        const content  = el('div',  { className: 'mgu-modal-content' }, closeBtn, inner);
+        const modal    = el('div',  { className: 'mgu-modal' }, content);
+
+        closeBtn.onclick = () => modal.remove();
+        modal.onclick    = ev => { if (ev.target === modal) modal.remove(); };
+        document.body.appendChild(modal);
+    }
+
+    // =========================================================
+    // GALLERY — process one comment
+    // =========================================================
+
+    async function processCommentGallery(target) {
+        if (!galleryEnabled || !TMDB_API_KEY) return;
+        if (processedGallery.has(target)) return;
+        processedGallery.add(target);
+
+        const mdDiv = IS_NEW_REDDIT ? getMdDiv(target) : target.querySelector('.md');
+        if (!mdDiv) return;
+
+        const text   = getCleanMdFullText(mdDiv);
+        const titles = extractGalleryTitles(text);
+        if (titles.length === 0) return;
+
+        const cardsWrapper = el('div', { className: 'mgu-cards-wrapper' });
+        const label        = el('div', { className: 'mgu-label', textContent: '🎬 Movies mentioned:' });
+        const container    = el('div', { className: 'mgu-container' }, label, cardsWrapper);
+        if (!galleryEnabled) container.style.display = 'none';
+        mdDiv.appendChild(container);
+
+        const seen = new Set();
+        for (let i = 0; i < titles.length; i++) {
+            const title = titles[i];
+            const norm  = title.toLowerCase().trim();
+            if (seen.has(norm)) continue;
+            seen.add(norm);
+            if (isBlockedTitle(normalizeTitle(title))) continue;
+            setTimeout(async () => {
+                if (!galleryEnabled) return;
+                const movie = await fetchMovieData(title);
+                if (movie) cardsWrapper.appendChild(createMovieCard(movie));
+            }, i * 150);
+        }
+    }
+
+    // =========================================================
+    // GALLERY — Intersection Observer
+    // =========================================================
+
+    function setupGalleryObserver() {
+        const io = new IntersectionObserver(entries => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) { processCommentGallery(entry.target); io.unobserve(entry.target); }
+            });
+        }, { rootMargin: '200px' });
+        getGalleryTargets().forEach(e => io.observe(e));
+        return io;
+    }
+
+    // =========================================================
+    // HIDER & COUNTER
+    // =========================================================
+
+    function hideElements() {
+        const comments = getAllComments();
+        const visible  = [];
+        comments.forEach(comment => {
+            const id = getCommentId(comment);
+            if (processedHiderIds.has(id)) {
+                if (comment.style.display !== 'none') visible.push(comment);
+                return;
+            }
+            const md   = getMdDiv(comment);
+            const text = md ? getCleanMdFullText(md).toLowerCase() : '';
+            const blocked = hiderEnabled && blocklist.some(k => text.includes(k.toLowerCase()));
+            if (blocked) { hiddenCommentCount++; comment.style.display = 'none'; }
+            else visible.push(comment);
+            processedHiderIds.add(id);
+        });
+        return visible;
+    }
+
+    function isLikelyMovieTitle(t) { return t.length <= 40 && t.split(/\s+/).length <= 6; }
+
+    function extractTitlesFromText(text) {
         const titles = [];
         const regex = /\b([A-Z][a-z0-9''\-]*(?:\s+[A-Z][a-z0-9''\-]*){1,5})\b/g;
-        let match;
-        while ((match = regex.exec(text)) !== null) {
-            const candidate = match[1].trim();
-            const wordCount = candidate.split(/\s+/).length;
-            if (wordCount >= 2 && wordCount <= 6 && candidate.length <= 40) titles.push(candidate);
+        let m;
+        while ((m = regex.exec(text)) !== null) {
+            const c = m[1].trim();
+            const wc = c.split(/\s+/).length;
+            if (wc >= 2 && wc <= 6 && c.length <= 40) titles.push(c);
         }
         return titles;
     }
 
     function countTitles(comments) {
-        const titleCounts = {};
-        const originalTitles = {};
-        totalTitleCount = 0;
-        blockedTitleCount = 0;
-
-        comments.forEach(commentElement => {
-            const commentText = commentElement.innerText || commentElement.textContent;
-            const trimmed = commentText.trim();
-            if (isLikelyMovieTitle(trimmed)) {
-                const norm = normalizeTitle(trimmed);
+        const counts = {}, originals = {};
+        totalTitleCount = 0; blockedTitleCount = 0;
+        comments.forEach(commentEl => {
+            const md      = getMdDiv(commentEl);
+            const text    = md ? getCleanMdFullText(md) : (commentEl.innerText || commentEl.textContent);
+            const trimmed = text.trim();
+            const process = title => {
+                const norm = normalizeTitle(title);
                 totalTitleCount++;
                 if (!isBlockedTitle(norm)) {
-                    titleCounts[norm] = (titleCounts[norm] || 0) + 1;
-                    if (!originalTitles[norm]) originalTitles[norm] = trimmed;
-                } else blockedTitleCount++;
-            } else {
-                extractTitles(trimmed).forEach(title => {
-                    const norm = normalizeTitle(title);
-                    totalTitleCount++;
-                    if (!isBlockedTitle(norm)) {
-                        titleCounts[norm] = (titleCounts[norm] || 0) + 1;
-                        if (!originalTitles[norm]) originalTitles[norm] = title;
-                    } else blockedTitleCount++;
-                });
-            }
+                    counts[norm] = (counts[norm] || 0) + 1;
+                    if (!originals[norm]) originals[norm] = title;
+                } else { blockedTitleCount++; }
+            };
+            if (isLikelyMovieTitle(trimmed)) process(trimmed);
+            else extractTitlesFromText(trimmed).forEach(process);
         });
-
-        return { titleCounts, originalTitles };
+        return { counts, originals };
     }
 
-    function getSortedTitles(titleCounts, originalTitles) {
-        return Object.entries(titleCounts)
-            .filter(([norm, count]) => count >= MIN_MENTIONS)
+    function getSorted(counts, originals) {
+        return Object.entries(counts)
+            .filter(([, c]) => c >= MIN_MENTIONS)
             .sort((a, b) => b[1] - a[1])
-            .map(([norm, count]) => [originalTitles[norm], count]);
+            .map(([norm, c]) => [originals[norm], c]);
     }
 
-    function displayResults(sortedTitles) {
-        const oldContainer = document.getElementById('title-count-results');
-        if (oldContainer) oldContainer.remove();
+    function displayResults(sorted) {
+        document.getElementById('rmu-results')?.remove();
+        if (!counterEnabled) return;
 
-        const container = document.createElement('div');
-        container.id = 'title-count-results';
-        container.style.background = '#fffbe7';
-        container.style.border = '2px solid #e3c800';
-        container.style.padding = '1em';
-        container.style.margin = '1em 0';
-        container.style.fontSize = '1.2em';
+        const container = el('div', { style: { background: '#fffbe7', border: '2px solid #e3c800', padding: '1em', margin: '1em 0', fontSize: '1.1em', fontFamily: 'sans-serif' } });
+        container.id = 'rmu-results';
 
-        let stats = `<div style="margin-bottom:0.5em;">
-            <b>Comments hidden:</b> ${hiddenCommentCount}<br>
-            <b>Movie titles found (total):</b> ${totalTitleCount}<br>
-            <b>Movie titles blocked (by keywords):</b> ${blockedTitleCount}
-        </div>`;
+        const statsDiv = el('div', { style: { marginBottom: '.5em' } });
+        statsDiv.appendChild(el('b', { textContent: 'Comments hidden: ' }));
+        statsDiv.appendChild(document.createTextNode(hiddenCommentCount + '   '));
+        statsDiv.appendChild(el('b', { textContent: 'Titles found: ' }));
+        statsDiv.appendChild(document.createTextNode(totalTitleCount + '   '));
+        statsDiv.appendChild(el('b', { textContent: 'Titles blocked: ' }));
+        statsDiv.appendChild(document.createTextNode(String(blockedTitleCount)));
+        container.appendChild(statsDiv);
 
-        if (sortedTitles.length === 0) {
-            container.innerHTML = stats + `No movie titles (not blocked) found with at least ${MIN_MENTIONS} mentions.`;
+        if (sorted.length === 0) {
+            container.appendChild(document.createTextNode(`No titles with ≥${MIN_MENTIONS} mentions.`));
         } else {
-            container.innerHTML = stats +
-                `<b>Most Mentioned Movie Titles (min ${MIN_MENTIONS}, excluding blocked, normalized):</b><br><ol>` +
-                sortedTitles.map(([title, count]) => `<li><b>${title}</b> (${count} mentions)</li>`).join('') +
-                '</ol>';
+            container.appendChild(el('b', { textContent: `Most mentioned (min ${MIN_MENTIONS}):` }));
+            container.appendChild(el('br'));
+            const ol = el('ol');
+            sorted.forEach(([t, c]) => {
+                const li = el('li');
+                li.appendChild(el('b', { textContent: t }));
+                li.appendChild(document.createTextNode(` (${c})`));
+                ol.appendChild(li);
+            });
+            container.appendChild(ol);
         }
 
-        const siteTable = document.getElementById('siteTable');
-        if (siteTable) siteTable.parentNode.insertBefore(container, siteTable);
-        else document.body.insertBefore(container, document.body.firstChild);
+        if (IS_NEW_REDDIT) {
+            const target = document.querySelector('shreddit-comment-tree') || document.body;
+            (target.parentNode || document.body).insertBefore(container, target);
+        } else {
+            const st = document.getElementById('siteTable');
+            if (st) st.parentNode.insertBefore(container, st);
+            else document.body.insertBefore(container, document.body.firstChild);
+        }
     }
 
     function recountAll() {
-        // Reset counts
         hiddenCommentCount = 0;
-        processedComments.clear();
-
-        const visibleComments = hideElements();
-        const { titleCounts, originalTitles } = countTitles(visibleComments);
-        const sortedTitles = getSortedTitles(titleCounts, originalTitles);
-        displayResults(sortedTitles);
+        processedHiderIds.clear();
+        const visible = hideElements();
+        const { counts, originals } = countTitles(visible);
+        displayResults(getSorted(counts, originals));
     }
 
-    // --- CLEAN TITLE FOR MANUAL COLLECTION ---
-    const suffixPattern = new RegExp(`(?:${junkSuffixes.join('|')}).*$`, 'i');
+    // =========================================================
+    // PANEL — settings section (blocklist + toggles + API key)
+    // =========================================================
 
-    function cleanMovieTitle(rawTitle) {
-        debugLog(`Cleaning title: "${rawTitle}"`);
-        let title = rawTitle.trim();
-        title = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
-        title = title.replace(/^(?:[A-Z][a-z]+'s?|\w+'s)\s+/g, '');
-        title = title.replace(suffixPattern, '');
-        title = title.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, '');
-        title = title.replace(/\s{2,}/g, ' ').trim();
-        debugLog(`Cleaned title: "${title}"`);
-        return title;
-    }
+    let settingsPanelOpen = false;
 
-    // --- UI & INITIALIZATION ---
-    function updateUI() {
-        const movieContent = document.getElementById('movieContent');
-        const debugStatus = document.getElementById('debugStatus');
+    function buildSettingsSection() {
+        const wrap = el('div', { id: 'rmu-settings' });
 
-        if (movieContent) {
-            if (movieList.length > 0) {
-                movieContent.textContent = movieList.map(m => `"${m}"`).join(', ');
+        // ── API Key ──────────────────────────────────────────
+        const apiSection = el('div', { className: 'rmu-settings-section' });
+        apiSection.appendChild(el('div', { className: 'rmu-settings-label', textContent: '🔑 TMDB API Key' }));
+
+        const apiRow = el('div', { className: 'rmu-settings-row' });
+        const apiInput = el('input', { type: 'password', id: 'rmu-api-input', placeholder: 'Paste TMDB API key (v3 auth)…', spellcheck: 'false' });
+        if (TMDB_API_KEY) apiInput.value = TMDB_API_KEY;
+
+        const apiStatus = el('span', { id: 'rmu-api-status' });
+        updateApiStatusEl(apiStatus);
+
+        const apiSaveBtn = el('button', { className: 'rmu-btn rmu-btn-sm', textContent: 'Save' });
+        apiSaveBtn.addEventListener('click', async () => {
+            const key = apiInput.value.trim();
+            if (!key) { apiStatus.textContent = '⚠️ Empty'; apiStatus.style.color = '#ffaaaa'; return; }
+            apiStatus.textContent = '⏳ Checking…';
+            apiStatus.style.color = '#aaa';
+            const ok = await verifyApiKey(key);
+            if (ok) {
+                TMDB_API_KEY = key;
+                GM_setValue('tmdbApiKey', key);
+                updateApiStatusEl(apiStatus);
+                buildPanel(); // rebuild to remove/show no-key warning
             } else {
-                movieContent.textContent = 'Click a comment to add to your list.';
-            }
-        }
-
-        if (debugStatus) {
-            debugStatus.textContent = debugMode ? '🐛 ON' : '🐛 OFF';
-            debugStatus.style.color = debugMode ? 'green' : 'gray';
-        }
-    }
-
-    const movieUtilitiesUI = document.createElement('div');
-    movieUtilitiesUI.id = 'movieUtilitiesUI';
-    movieUtilitiesUI.innerHTML = `
-        <div id="uiHeader">🎬 Movie Utilities</div>
-        <div id="galleryButtons">
-            <button id="recountBtn">Recount</button>
-            <button id="debugBtn" style="font-size:10px;"><span id="debugStatus">🐛</span></button>
-        </div>
-        <div id="collectorSection">
-            <div id="collectorHeader">
-                <span>Manual Collector</span>
-                <div id="collectorControls">
-                    <button id="copyBtn">Copy</button>
-                    <button id="clearBtn">Clear</button>
-                </div>
-            </div>
-            <div id="movieContent">(click a comment to add)</div>
-        </div>
-    `;
-    document.body.appendChild(movieUtilitiesUI);
-
-    document.getElementById('recountBtn').addEventListener('click', recountAll);
-    document.getElementById('debugBtn').addEventListener('click', toggleDebug);
-
-    document.getElementById('copyBtn').addEventListener('click', () => {
-        const textToCopy = movieList.map(m => `"${m}"`).join(', ');
-        navigator.clipboard.writeText(textToCopy).then(() => alert('Manual list copied!'));
-    });
-
-    document.getElementById('clearBtn').addEventListener('click', () => {
-        movieList = [];
-        saveMovieList();
-        updateUI();
-    });
-
-    // --- IMPROVED CLICK HANDLING ---
-    document.addEventListener('click', function (e) {
-        const currentTime = Date.now();
-
-        // Prevent double-clicks and rapid clicking
-        if (currentTime - lastClickTime < 200) {
-            debugLog('Click ignored: too rapid');
-            return;
-        }
-        lastClickTime = currentTime;
-
-        // Check if click is on UI elements
-        if (e.target.closest('#movieUtilitiesUI') || e.target.closest('#title-count-results')) {
-            debugLog('Click ignored: on UI element');
-            return;
-        }
-
-        // Check if text is currently selected
-        const selection = window.getSelection();
-        if (selection.toString().trim().length > 0) {
-            debugLog('Click ignored: text is selected');
-            return;
-        }
-
-        const commentContainer = e.target.closest('.thing');
-        debugLog('Comment container found:', !!commentContainer);
-
-        if (commentContainer) {
-            // Try multiple selectors for comment text
-            const selectors = [
-                '.usertext-body .md p',
-                '.usertext-body .md',
-                '.usertext-body',
-                '.entry .usertext .usertext-body .md p',
-                '.entry .usertext .usertext-body .md'
-            ];
-
-            let mdText = null;
-            for (const selector of selectors) {
-                mdText = commentContainer.querySelector(selector);
-                if (mdText) {
-                    debugLog(`Found text with selector: ${selector}`);
-                    break;
-                }
-            }
-
-            if (mdText) {
-                const rawTitle = mdText.textContent.trim();
-                debugLog('Raw title extracted:', rawTitle);
-
-                if (rawTitle.length === 0) {
-                    debugLog('Title is empty');
-                    return;
-                }
-
-                const movie = cleanMovieTitle(rawTitle);
-                debugLog('Cleaned movie title:', movie);
-
-                if (movie && movie.length > 0) {
-                    const normalizedForBlocking = normalizeTitle(movie);
-                    debugLog('Normalized for blocking check:', normalizedForBlocking);
-
-                    if (!isBlockedTitle(normalizedForBlocking)) {
-                        if (!movieList.includes(movie)) {
-                            movieList.push(movie);
-                            saveMovieList();
-                            updateUI();
-                            debugLog('Movie added to list:', movie);
-
-                            // Visual feedback
-                            commentContainer.style.backgroundColor = '#e8f5e8';
-                            setTimeout(() => {
-                                commentContainer.style.backgroundColor = '';
-                            }, 1000);
-                        } else {
-                            debugLog('Movie already in list:', movie);
-                        }
-                    } else {
-                        debugLog('Movie is blocked:', movie);
-                    }
-                } else {
-                    debugLog('Movie title is empty after cleaning');
-                }
-            } else {
-                debugLog('No comment text found with any selector');
-                // Debug: show what selectors are available
-                if (debugMode) {
-                    const allElements = commentContainer.querySelectorAll('*');
-                    console.log('Available elements in comment:', Array.from(allElements).map(el => el.tagName + (el.className ? '.' + el.className.replace(/\s+/g, '.') : '')));
-                }
-            }
-        }
-    });
-
-    // --- MUTATION OBSERVER FOR DYNAMIC CONTENT ---
-    function setupMutationObserver() {
-        const observer = new MutationObserver((mutations) => {
-            let newCommentsDetected = false;
-
-            mutations.forEach((mutation) => {
-                mutation.addedNodes.forEach((node) => {
-                    // Check if the added node is a comment or contains comments
-                    if (node.nodeType === 1) { // Element node
-                        if (node.classList && node.classList.contains('comment')) {
-                            newCommentsDetected = true;
-                        } else if (node.querySelectorAll) {
-                            const comments = node.querySelectorAll('.thing.comment');
-                            if (comments.length > 0) {
-                                newCommentsDetected = true;
-                            }
-                        }
-                    }
-                });
-            });
-
-            if (newCommentsDetected) {
-                debugLog('New comments detected via mutation observer');
-                // Process new comments
-                hideElements();
-                // Update the count display
-                const visibleComments = document.querySelectorAll('.thing.comment:not([style*="display: none"])');
-                const { titleCounts, originalTitles } = countTitles(visibleComments);
-                const sortedTitles = getSortedTitles(titleCounts, originalTitles);
-                displayResults(sortedTitles);
+                apiStatus.textContent = '❌ Invalid';
+                apiStatus.style.color = '#ff6b6b';
             }
         });
 
-        // Start observing the document body for changes
-        const targetNode = document.body;
-        const config = {
-            childList: true,
-            subtree: true
-        };
+        apiRow.appendChild(apiInput);
+        apiRow.appendChild(apiSaveBtn);
+        apiSection.appendChild(apiRow);
+        apiSection.appendChild(apiStatus);
 
-        observer.observe(targetNode, config);
-        debugLog('Mutation observer initialized');
+        const apiGuide = el('div', { className: 'rmu-guide' });
+        apiGuide.appendChild(document.createTextNode('Free key from '));
+        const tmdbLink = el('a', { href: 'https://www.themoviedb.org/settings/api', target: '_blank', textContent: 'themoviedb.org → Settings → API' });
+        apiGuide.appendChild(tmdbLink);
+        apiGuide.appendChild(document.createTextNode('. Only needed for Movie Gallery.'));
+        apiSection.appendChild(apiGuide);
+        wrap.appendChild(apiSection);
+
+        // ── Toggles ──────────────────────────────────────────
+        const toggleSection = el('div', { className: 'rmu-settings-section' });
+        toggleSection.appendChild(el('div', { className: 'rmu-settings-label', textContent: '⚙️ Features' }));
+
+        const toggles = [
+            { key: 'hiderEnabled',     label: '🚫 Comment Hider',   get: () => hiderEnabled,     set: v => { hiderEnabled     = v; saveSetting('hiderEnabled', v);     recountAll(); } },
+            { key: 'counterEnabled',   label: '📊 Title Counter',    get: () => counterEnabled,   set: v => { counterEnabled   = v; saveSetting('counterEnabled', v);   recountAll(); } },
+            { key: 'collectorEnabled', label: '🖱 Manual Collector', get: () => collectorEnabled, set: v => { collectorEnabled = v; saveSetting('collectorEnabled', v);         } },
+            { key: 'debugMode',        label: '🐛 Debug Mode',       get: () => debugMode,        set: v => { debugMode        = v; saveSetting('debugMode', v);                } },
+        ];
+
+        toggles.forEach(({ label, get, set }) => {
+            const row   = el('div', { className: 'rmu-toggle-row' });
+            const lbl   = el('span', { className: 'rmu-toggle-label', textContent: label });
+            const btn   = el('button', { className: 'rmu-toggle-btn' + (get() ? ' rmu-toggle-on' : ''), textContent: get() ? 'ON' : 'OFF' });
+            btn.addEventListener('click', () => {
+                const newVal = !get();
+                set(newVal);
+                btn.textContent = newVal ? 'ON' : 'OFF';
+                btn.className = 'rmu-toggle-btn' + (newVal ? ' rmu-toggle-on' : '');
+            });
+            row.appendChild(lbl);
+            row.appendChild(btn);
+            toggleSection.appendChild(row);
+        });
+        wrap.appendChild(toggleSection);
+
+        // ── Blocklist ─────────────────────────────────────────
+        const blSection = el('div', { className: 'rmu-settings-section' });
+        const blHeader  = el('div', { className: 'rmu-settings-label' });
+        blHeader.appendChild(document.createTextNode('🚫 Blocklist '));
+        const blCount = el('span', { className: 'rmu-badge', id: 'rmu-bl-count', textContent: String(blocklist.length) });
+        blHeader.appendChild(blCount);
+        blSection.appendChild(blHeader);
+
+        // List
+        const blList = el('div', { id: 'rmu-bl-list' });
+        renderBlocklistEl(blList);
+        blSection.appendChild(blList);
+
+        // Add input
+        const blAddRow = el('div', { className: 'rmu-add-row' });
+        const blInput  = el('input', { type: 'text', id: 'rmu-bl-input', placeholder: 'Add titles, comma-separated…', spellcheck: 'false' });
+        const blAddBtn = el('button', { className: 'rmu-btn rmu-btn-sm', textContent: 'Add' });
+
+        const doAdd = () => {
+            const entries = parseBlocklistInput(blInput.value);
+            if (!entries.length) return;
+            const added = entries.filter(v => !blocklist.includes(v));
+            if (!added.length) return;
+            blocklist.push(...added);
+            saveBlocklist();
+            blInput.value = '';
+            renderBlocklistEl(blList);
+            document.getElementById('rmu-bl-count').textContent = String(blocklist.length);
+            if (hiderEnabled) recountAll();
+        };
+        blAddBtn.addEventListener('click', doAdd);
+        blInput.addEventListener('keydown', e => { if (e.key === 'Enter') doAdd(); });
+        blAddRow.appendChild(blInput);
+        blAddRow.appendChild(blAddBtn);
+        blSection.appendChild(blAddRow);
+
+        // Export / Import
+        const blExportRow = el('div', { className: 'rmu-add-row', style: { marginTop: '6px' } });
+        const blCopyBtn   = el('button', { className: 'rmu-btn rmu-btn-sm', textContent: '📋 Copy JSON' });
+        const blImportBtn = el('button', { className: 'rmu-btn rmu-btn-sm', textContent: '📥 Import' });
+        const blClearBtn  = el('button', { className: 'rmu-btn rmu-btn-sm rmu-btn-danger', textContent: '🗑 Clear' });
+
+        blCopyBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(JSON.stringify(blocklist, null, 2))
+                .then(() => { blCopyBtn.textContent = '✅ Copied!'; setTimeout(() => blCopyBtn.textContent = '📋 Copy JSON', 1500); });
+        });
+
+        let importBox = null;
+        blImportBtn.addEventListener('click', () => {
+            if (!importBox) {
+                importBox = el('textarea', { placeholder: 'Paste titles (comma-separated or JSON array)…', style: { width: '100%', height: '60px', marginTop: '5px', background: '#0d0d1a', border: '1px solid #333', borderRadius: '5px', color: '#7fce9f', fontSize: '10px', fontFamily: 'monospace', padding: '5px', resize: 'vertical' } });
+                blSection.insertBefore(importBox, blExportRow);
+                blImportBtn.textContent = '✅ Confirm';
+            } else {
+                const entries = parseBlocklistInput(importBox.value);
+                const before  = blocklist.length;
+                blocklist = [...new Set([...blocklist, ...entries])];
+                saveBlocklist();
+                renderBlocklistEl(blList);
+                document.getElementById('rmu-bl-count').textContent = String(blocklist.length);
+                if (hiderEnabled) recountAll();
+                importBox.remove(); importBox = null;
+                blImportBtn.textContent = '📥 Import';
+            }
+        });
+
+        blClearBtn.addEventListener('click', () => {
+            if (!confirm(`Clear all ${blocklist.length} blocked titles?`)) return;
+            blocklist = [];
+            saveBlocklist();
+            renderBlocklistEl(blList);
+            document.getElementById('rmu-bl-count').textContent = '0';
+            if (hiderEnabled) recountAll();
+        });
+
+        blExportRow.appendChild(blCopyBtn);
+        blExportRow.appendChild(blImportBtn);
+        blExportRow.appendChild(blClearBtn);
+        blSection.appendChild(blExportRow);
+        wrap.appendChild(blSection);
+
+        return wrap;
     }
 
-    // --- STYLES ---
-    GM_addStyle(`
-        #movieUtilitiesUI {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            width: 300px;
-            max-height: 400px;
-            overflow-y: auto;
-            background: #fff;
-            border: 1px solid #ccc;
-            border-radius: 10px;
-            font-family: sans-serif;
-            font-size: 14px;
-            padding: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-            z-index: 9999;
+    function renderBlocklistEl(container) {
+        container.textContent = '';
+        if (blocklist.length === 0) {
+            container.appendChild(el('div', { className: 'rmu-bl-empty', textContent: 'No blocked titles yet.' }));
+            return;
         }
-        #uiHeader { font-size:16px; font-weight:bold; margin-bottom:10px; border-bottom:1px solid #eee; padding-bottom:5px; }
-        #galleryButtons { display:flex; justify-content:space-between; margin-bottom:10px; }
-        #collectorSection { border-top:1px solid #eee; padding-top:10px; }
-        #collectorHeader { display:flex; justify-content:space-between; align-items:center; font-weight:bold; margin-bottom:5px; }
-        #collectorControls { display:flex; gap:5px; }
-        #movieUtilitiesUI button { background:#0079d3; border:none; color:white; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:12px; }
-        #movieUtilitiesUI button:hover { background:#005fa3; }
-        #movieContent { white-space: pre-wrap; word-wrap: break-word; }
-        #title-count-results { background:#fffbe7; border:2px solid #e3c800; padding:1em; margin:1em 0; font-size:1.2em; }
+        const maxVisible = 6;
+        const shown = blocklist.slice(0, maxVisible);
+        shown.forEach((entry, i) => {
+            const removeBtn = el('button', { className: 'rmu-bl-remove', textContent: '✕', title: 'Remove' });
+            removeBtn.addEventListener('click', () => {
+                blocklist.splice(i, 1);
+                saveBlocklist();
+                renderBlocklistEl(container);
+                const countEl = document.getElementById('rmu-bl-count');
+                if (countEl) countEl.textContent = String(blocklist.length);
+                if (hiderEnabled) recountAll();
+            });
+            container.appendChild(el('div', { className: 'rmu-bl-entry' },
+                el('span', { className: 'rmu-bl-title', textContent: entry }),
+                removeBtn
+            ));
+        });
+        if (blocklist.length > maxVisible) {
+            container.appendChild(el('div', { className: 'rmu-bl-more', textContent: `+ ${blocklist.length - maxVisible} more…` }));
+        }
+    }
+
+    function updateApiStatusEl(statusEl) {
+        if (TMDB_API_KEY) {
+            statusEl.textContent = '✅ Key saved';
+            statusEl.style.color = '#4caf50';
+        } else {
+            statusEl.textContent = 'No key set — only needed for Movie Gallery';
+            statusEl.style.color = '#888';
+        }
+    }
+
+    async function verifyApiKey(key) {
+        return new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `https://api.themoviedb.org/3/configuration?api_key=${encodeURIComponent(key)}`,
+                headers: { Accept: 'application/json' },
+                onload:  res => resolve(res.status === 200),
+                onerror: ()  => resolve(false)
+            });
+        });
+    }
+
+    // =========================================================
+    // PANEL UI
+    // =========================================================
+
+    function buildPanel() {
+        document.getElementById('rmu-panel')?.remove();
+
+        // No-key warning when gallery is on but no key
+        let noKeyDiv = null;
+        if (galleryEnabled && !TMDB_API_KEY) {
+            noKeyDiv = el('div', { id: 'rmu-no-key' });
+            noKeyDiv.appendChild(el('strong', { textContent: 'Movie Gallery is on ' }));
+            noKeyDiv.appendChild(document.createTextNode('but no API key is set. Expand Settings below to add one.'));
+        }
+
+        const recountBtn = el('button', { className: 'rmu-btn', textContent: '⟳ Recount' });
+        const galleryBtn = el('button', { className: 'rmu-btn', id: 'rmu-gallery-btn', textContent: galleryEnabled ? '🎬 Gallery ON' : '🎬 Gallery OFF' });
+        const settingsBtn = el('button', { className: 'rmu-btn', id: 'rmu-settings-btn', textContent: settingsPanelOpen ? '⚙️ Settings ▲' : '⚙️ Settings ▼' });
+        const buttonsDiv = el('div', { id: 'rmu-buttons' }, recountBtn, galleryBtn, settingsBtn);
+
+        // Settings panel
+        const settingsWrap = el('div', { id: 'rmu-settings-wrap', style: { display: settingsPanelOpen ? 'block' : 'none' } });
+        settingsWrap.appendChild(buildSettingsSection());
+
+        // Collector
+        const movieContent = el('div', { id: 'rmu-movie-content' });
+        updateMovieContentEl(movieContent);
+        const copyBtn  = el('button', { className: 'rmu-btn', textContent: 'Copy' });
+        const clearBtn = el('button', { className: 'rmu-btn', textContent: 'Clear' });
+        const controls = el('div', { id: 'rmu-collector-controls' }, copyBtn, clearBtn);
+        const colHeader = el('div', { id: 'rmu-collector-header' },
+            el('span', { textContent: 'Manual Collector' }),
+            controls
+        );
+        const collector = el('div', { id: 'rmu-collector' }, colHeader, movieContent);
+
+        const body = el('div', { id: 'rmu-body' });
+        if (noKeyDiv) body.appendChild(noKeyDiv);
+        body.appendChild(buttonsDiv);
+        body.appendChild(settingsWrap);
+        body.appendChild(collector);
+
+        const collapseBtn = el('button', { id: 'rmu-collapse-btn', title: 'Collapse', textContent: '▲' });
+        const headerTitle = el('div', { id: 'rmu-header-title', textContent: '🎬 Movie Utilities' });
+        const header      = el('div', { id: 'rmu-header' }, headerTitle, collapseBtn);
+        const panel       = el('div', { id: 'rmu-panel' }, header, body);
+        document.body.appendChild(panel);
+
+        // Collapse
+        let collapsed = false;
+        collapseBtn.addEventListener('click', e => {
+            e.stopPropagation();
+            collapsed = !collapsed;
+            body.classList.toggle('rmu-collapsed', collapsed);
+            collapseBtn.textContent = collapsed ? '▼' : '▲';
+        });
+
+        recountBtn.addEventListener('click', recountAll);
+
+        galleryBtn.addEventListener('click', () => {
+            galleryEnabled = !galleryEnabled;
+            saveSetting('galleryEnabled', galleryEnabled);
+            document.querySelectorAll('.mgu-container').forEach(c => {
+                c.style.display = galleryEnabled ? 'block' : 'none';
+            });
+            buildPanel();
+        });
+
+        settingsBtn.addEventListener('click', () => {
+            settingsPanelOpen = !settingsPanelOpen;
+            settingsWrap.style.display = settingsPanelOpen ? 'block' : 'none';
+            settingsBtn.textContent = settingsPanelOpen ? '⚙️ Settings ▲' : '⚙️ Settings ▼';
+        });
+
+        copyBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(movieList.map(m => `"${m}"`).join(', '))
+                .then(() => alert('Collector list copied!'));
+        });
+
+        clearBtn.addEventListener('click', () => {
+            movieList = [];
+            saveMovieList();
+            updateMovieContentEl(document.getElementById('rmu-movie-content'));
+        });
+    }
+
+    function updateMovieContentEl(elNode) {
+        if (!elNode) return;
+        elNode.textContent = movieList.length
+            ? movieList.map(m => `"${m}"`).join(', ')
+            : '(click a comment to add)';
+    }
+
+    // =========================================================
+    // CLICK → MANUAL COLLECTOR
+    // =========================================================
+
+    document.addEventListener('click', e => {
+        if (!collectorEnabled) return;
+        const now = Date.now();
+        if (now - lastClickTime < 200) return;
+        lastClickTime = now;
+
+        if (e.target.closest('#rmu-panel')   ||
+            e.target.closest('#rmu-results') ||
+            e.target.closest('.mgu-card')    ||
+            e.target.closest('.mgu-modal')) return;
+
+        const sel = window.getSelection();
+        if (sel.toString().trim().length > 0) return;
+
+        const commentEl = getCommentFromClick(e.target);
+        if (!commentEl) return;
+
+        const rawTitle = getCleanFirstParagraph(commentEl);
+        if (!rawTitle) return;
+
+        const movie = cleanMovieTitle(rawTitle);
+        if (!movie) return;
+
+        if (isBlockedTitle(normalizeTitle(movie))) { debugLog('Blocked:', movie); return; }
+
+        if (!movieList.includes(movie)) {
+            movieList.push(movie);
+            saveMovieList();
+            updateMovieContentEl(document.getElementById('rmu-movie-content'));
+            debugLog('Added:', movie);
+            commentEl.style.outline = '2px solid #4caf50';
+            setTimeout(() => commentEl.style.outline = '', 1000);
+        }
+    });
+
+    // =========================================================
+    // MUTATION OBSERVER
+    // =========================================================
+
+    function setupMutationObserver(galleryIO) {
+        const mo = new MutationObserver(mutations => {
+            let newComments = false;
+            mutations.forEach(mut => {
+                mut.addedNodes.forEach(node => {
+                    if (node.nodeType !== 1) return;
+                    if (IS_NEW_REDDIT) {
+                        if (node.tagName === 'SHREDDIT-COMMENT') { galleryIO.observe(node); newComments = true; }
+                        node.querySelectorAll?.('shreddit-comment').forEach(e => { galleryIO.observe(e); newComments = true; });
+                    } else {
+                        node.querySelectorAll?.('.usertext-body').forEach(e => galleryIO.observe(e));
+                        if (node.classList?.contains('comment') || node.querySelectorAll?.('.thing.comment').length > 0)
+                            newComments = true;
+                    }
+                });
+            });
+            if (newComments) {
+                hideElements();
+                const visible = getAllComments().filter(c => c.style.display !== 'none');
+                const { counts, originals } = countTitles(visible);
+                displayResults(getSorted(counts, originals));
+            }
+        });
+        mo.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // =========================================================
+    // STYLES
+    // =========================================================
+
+    GM_addStyle(`
+        /* ── Panel ── */
+        #rmu-panel {
+            position: fixed; bottom: 20px; right: 20px;
+            width: 340px; max-height: 90vh; overflow-y: auto;
+            background: #1a1a2e; border: 1px solid #e94560; border-radius: 10px;
+            font-family: 'Segoe UI', sans-serif; font-size: 13px; padding: 10px;
+            box-shadow: 0 4px 20px rgba(233,69,96,.3); z-index: 10001; color: #e0e0e0;
+        }
+        #rmu-header {
+            font-size: 15px; font-weight: bold; margin-bottom: 8px;
+            border-bottom: 1px solid #e94560; padding-bottom: 6px; color: #e94560;
+            letter-spacing: .5px; display: flex; align-items: center; justify-content: space-between;
+            user-select: none;
+        }
+        #rmu-header-title { display: flex; align-items: center; gap: 6px; }
+        #rmu-collapse-btn { font-size: 12px; color: #888; background: none; border: none; cursor: pointer; padding: 0 4px; line-height: 1; }
+        #rmu-collapse-btn:hover { color: #e94560; }
+        #rmu-body.rmu-collapsed { display: none; }
+        #rmu-no-key {
+            background: #2a0a12; border: 1px solid #e94560; border-radius: 6px;
+            padding: 10px; font-size: 12px; color: #ffaaaa; line-height: 1.5; margin-bottom: 8px;
+        }
+        #rmu-buttons { display: flex; gap: 5px; margin-bottom: 8px; flex-wrap: wrap; }
+        #rmu-panel button.rmu-btn {
+            background: #e94560; border: none; color: #fff; padding: 4px 8px;
+            border-radius: 5px; cursor: pointer; font-size: 11px; font-weight: 600;
+            transition: background .15s; font-family: inherit;
+        }
+        #rmu-panel button.rmu-btn:hover { background: #c73652; }
+        #rmu-panel button.rmu-btn-danger { background: #7a1a2a; }
+        #rmu-panel button.rmu-btn-danger:hover { background: #9a2a3a; }
+        #rmu-panel button.rmu-btn-sm { padding: 3px 7px; font-size: 10px; }
+
+        /* ── Settings ── */
+        #rmu-settings { border-top: 1px solid #2a2a4a; padding-top: 8px; margin-bottom: 8px; }
+        .rmu-settings-section { margin-bottom: 12px; }
+        .rmu-settings-label { font-size: 10px; text-transform: uppercase; letter-spacing: .8px; color: #666; margin-bottom: 6px; }
+        .rmu-settings-row { display: flex; gap: 5px; margin-bottom: 4px; }
+        .rmu-settings-row input { flex: 1; background: #0d0d1a; border: 1px solid #333; border-radius: 5px; color: #eee; padding: 4px 7px; font-size: 11px; outline: none; font-family: monospace; }
+        .rmu-settings-row input:focus { border-color: #e94560; }
+        #rmu-api-status { font-size: 10px; display: block; margin-bottom: 4px; }
+        .rmu-guide { font-size: 10px; color: #666; line-height: 1.5; }
+        .rmu-guide a { color: #7fbaff; text-decoration: none; }
+        .rmu-guide a:hover { text-decoration: underline; }
+        .rmu-toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 4px 0; }
+        .rmu-toggle-label { font-size: 12px; color: #ccc; }
+        .rmu-toggle-btn { background: #333 !important; color: #888 !important; padding: 2px 8px !important; font-size: 10px !important; border-radius: 10px !important; min-width: 34px; }
+        .rmu-toggle-btn.rmu-toggle-on { background: #e94560 !important; color: #fff !important; }
+
+        /* ── Blocklist ── */
+        #rmu-bl-list { max-height: 120px; overflow-y: auto; background: #0d0d1a; border: 1px solid #2a2a4a; border-radius: 5px; padding: 4px; margin-bottom: 6px; }
+        .rmu-bl-entry { display: flex; align-items: center; gap: 5px; padding: 3px 4px; border-radius: 3px; font-size: 11px; }
+        .rmu-bl-entry:hover { background: #1e1e3a; }
+        .rmu-bl-title { flex: 1; color: #ddd; }
+        .rmu-bl-remove { background: transparent !important; color: #e94560 !important; border: none !important; cursor: pointer; font-size: 12px !important; padding: 0 3px !important; border-radius: 3px; flex-shrink: 0; }
+        .rmu-bl-remove:hover { background: #2a0a12 !important; }
+        .rmu-bl-empty { color: #555; font-size: 11px; padding: 4px; font-style: italic; }
+        .rmu-bl-more { color: #666; font-size: 10px; padding: 2px 4px; font-style: italic; }
+        .rmu-badge { display: inline-block; background: #e94560; color: #fff; font-size: 10px; font-weight: bold; padding: 1px 5px; border-radius: 8px; margin-left: 4px; }
+        .rmu-add-row { display: flex; gap: 5px; }
+        .rmu-add-row input { flex: 1; background: #0d0d1a; border: 1px solid #333; border-radius: 5px; color: #eee; padding: 4px 7px; font-size: 11px; outline: none; }
+        .rmu-add-row input:focus { border-color: #e94560; }
+
+        /* ── Collector ── */
+        #rmu-collector { border-top: 1px solid #333; padding-top: 8px; margin-top: 6px; }
+        #rmu-collector-header { display: flex; justify-content: space-between; align-items: center; font-weight: bold; margin-bottom: 5px; color: #aaa; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+        #rmu-collector-controls { display: flex; gap: 5px; }
+        #rmu-movie-content { white-space: pre-wrap; word-wrap: break-word; color: #ccc; font-size: 12px; max-height: 100px; overflow-y: auto; }
+
+        /* ── Stats bar ── */
+        #rmu-results { background: #fffbe7; border: 2px solid #e3c800; padding: 1em; margin: 1em 0; font-size: 1.1em; font-family: sans-serif; }
+
+        /* ── Gallery ── */
+        .mgu-container { background: #0f0f0f; padding: 12px; margin: 10px 0; border-radius: 6px; border-left: 3px solid #e50914; }
+        .mgu-label { color: #999; font-size: 11px; margin-bottom: 8px; font-weight: bold; }
+        .mgu-cards-wrapper { display: flex; flex-wrap: wrap; gap: 0; }
+        .mgu-card { display: inline-block; width: 140px; margin: 8px 8px 8px 0; background: #1a1a1a; border-radius: 6px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.3); transition: transform .2s, box-shadow .2s; cursor: pointer; vertical-align: top; }
+        .mgu-card:hover { transform: scale(1.05) translateY(-4px); box-shadow: 0 4px 12px rgba(229,9,20,.5); }
+        .mgu-poster-wrap { position: relative; width: 100%; padding-top: 150%; background: #222; }
+        .mgu-poster-img  { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
+        .mgu-card-info   { padding: 8px; color: #fff; }
+        .mgu-rating      { font-size: 10px; color: #ffd700; margin-top: 2px; }
+        .mgu-card-title  { font-size: 11px; font-weight: bold; line-height: 1.2; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+        .mgu-card-year   { font-size: 10px; color: #999; }
+
+        /* ── Modal ── */
+        .mgu-modal         { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,.85); z-index: 10002; display: flex; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto; }
+        .mgu-modal-content { background: #1a1a1b; border-radius: 12px; padding: 20px; max-width: 900px; width: 100%; color: #fff; box-shadow: 0 0 30px rgba(0,0,0,.7); position: relative; font-family: sans-serif; }
+        .mgu-modal-close   { position: absolute; top: 10px; right: 14px; cursor: pointer; font-size: 18px; color: #aaa; line-height: 1; }
+        .mgu-modal-close:hover { color: #fff; }
+        .mgu-modal-inner   { display: flex; flex-direction: row; gap: 20px; }
+        .mgu-modal-poster  { width: 180px; height: auto; border-radius: 8px; object-fit: contain; flex-shrink: 0; }
+        .mgu-modal-info    { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+        .mgu-modal-title   { font-size: 22px; font-weight: bold; }
+        .mgu-modal-rating  { font-size: 16px; color: #ffd700; }
+        .mgu-modal-overview{ font-size: 14px; line-height: 1.6; flex-grow: 1; }
+        .mgu-modal-director, .mgu-modal-others, .mgu-modal-latest { font-size: 13px; }
+        .mgu-modal-actors  { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+        .mgu-actor         { text-align: center; font-size: 12px; width: 80px; }
+        .mgu-actor img     { width: 80px; height: 80px; object-fit: cover; border-radius: 50%; }
+        .mgu-actor-noimg   { width: 80px; height: 80px; border-radius: 50%; background: #333; }
+        .mgu-letterboxd-btn{ display: block; margin-top: 14px; background: #e50914; color: #fff; font-weight: bold; text-align: center; padding: 10px 0; border-radius: 8px; cursor: pointer; text-decoration: none; font-size: 15px; }
+        .mgu-letterboxd-btn:hover { background: #c10812; }
     `);
 
-    // --- INITIAL LOAD ---
+    // =========================================================
+    // INIT
+    // =========================================================
+
     window.addEventListener('load', () => {
+        const delay = IS_NEW_REDDIT ? 2500 : 1000;
         setTimeout(() => {
+            buildPanel();
             recountAll();
-            updateUI();
-            setupMutationObserver(); // Start watching for dynamic content
-            debugLog('Script initialized with mutation observer');
-        }, 1000);
+            const galleryIO = setupGalleryObserver();
+            setupMutationObserver(galleryIO);
+        }, delay);
     });
+
 })();
